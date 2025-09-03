@@ -33,7 +33,7 @@ function coerceRpcUrl(raw: string | undefined, chain: SupportedChain): string {
 export function getPublicClient(chain: SupportedChain = 'polygon') {
   const url =
     chain === 'polygon'
-      ? coerceRpcUrl(process.env.ALCHEMY_POLYGON_URL, 'polygon')
+      ? coerceRpcUrl(process.env.NEXT_PUBLIC_ALCHEMY_POLYGON_URL, 'polygon')
       : coerceRpcUrl(process.env.ALCHEMY_ETHEREUM_URL, 'mainnet');
 
   return createPublicClient({

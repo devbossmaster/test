@@ -1,145 +1,378 @@
-// /app/advanced/page.tsx
-'use client';
+// app/advanced/page.tsx
+"use client";
 
-import { useMemo, useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
-import { DEFAULT_UNIVERSE } from '@/lib/tokens';
+import React, { useMemo, useState } from "react";
+import useSWR from "swr";
+import { TOKENS } from "@/lib/tokens";
 
-function useAdvancedScan(params: Record<string, string>) {
-  const qs = new URLSearchParams(params).toString();
-  return useQuery({
-    queryKey: ['scan-advanced', qs],
-    queryFn: async () => {
-      const r = await fetch('/api/scan-advanced?' + qs, { cache: 'no-store' });
-      if (!r.ok) throw new Error(await r.text());
-      return r.json();
-    },
-    refetchInterval: Number(params.interval || '10000'),
+const fetcher = (url: string) => fetch(url).then((r) => r.json());
+
+function useAdvancedScan(params: {
+  base: string;        // e.g. "WMATIC"
+  maxIn: string;       // e.g. "5"
+  maxHops: string;     // "2" | "3" | "4"
+  minBps?: string;     // e.g. "-500" for -5.00%
+  profitable?: string; // "0" to allow ≤0 nets
+}) {
+  const qs = new URLSearchParams({
+    base: params.base,
+    maxIn: params.maxIn,
+    maxHops: params.maxHops,
   });
+  if (params.minBps != null) qs.set("minBps", params.minBps);
+  if (params.profitable != null) qs.set("profitable", params.profitable);
+
+  const url = `/api/scan-advanced?${qs.toString()}`;
+
+  const swr = useSWR(url, fetcher, {
+    refreshInterval: 30_000,
+    revalidateOnFocus: false,
+  });
+
+  return { ...swr, url };
 }
 
-function human(n: string | number, decimals = 18) {
-  const x = typeof n === 'string' ? BigInt(n) : BigInt(Math.floor(n));
-  const dp = 10n ** BigInt(decimals);
-  const i = x / dp; const f = x % dp;
-  const fs = f.toString().padStart(decimals, '0').replace(/0+$/,'');
-  return fs ? `${i}.${fs}` : `${i}`;
+function makeAddrToSymbol() {
+  const map = new Map<string, string>();
+  Object.values(TOKENS).forEach((t) =>
+    map.set((t.address as string).toLowerCase(), t.symbol)
+  );
+  return (addr: string) =>
+    map.get(addr.toLowerCase()) || addr.slice(0, 6) + "…" + addr.slice(-4);
 }
 
-export default function AdvancedPage() {
-  const [base, setBase] = useState('WMATIC');
-  const [q, setQ] = useState(DEFAULT_UNIVERSE.join(','));
-  const [maxInUi, setMaxInUi] = useState('10');   // in base units
-  const [gas, setGas] = useState('30');           // gwei
-  const [flashBps, setFlashBps] = useState('9');
-  const [slip, setSlip] = useState('50');
-  const [limit, setLimit] = useState('50');       // 10/20/50/100/250
-  const [interval, setInterval] = useState('10000'); // ms
+function HeaderTile({
+  label,
+  value,
+}: {
+  label: string;
+  value: React.ReactNode;
+}) {
+  return (
+    <div className="bg-slate-900/60 border border-slate-800 rounded-2xl p-4 flex flex-col gap-1">
+      <div className="text-xs text-slate-400">{label}</div>
+      <div className="text-lg font-semibold">{value}</div>
+    </div>
+  );
+}
 
-  const maxIn = useMemo(() => {
-    const dp = 18; const [i,f=''] = maxInUi.split('.');
-    return (i + f.padEnd(dp,'0')).slice(0, i.length + dp).replace(/\D/g,'') || '0';
-  }, [maxInUi]);
+function SectionCard({ title, right }: { title: string; right?: React.ReactNode }) {
+  return (
+    <div className="rounded-2xl border border-slate-800 bg-slate-900/40 p-4">
+      <div className="flex items-center justify-between mb-3">
+        <h3 className="text-lg font-semibold">{title}</h3>
+        {right ? right : <div />}
+      </div>
+      <div className="space-y-3">
+        {/* children injected at usage */}
+      </div>
+    </div>
+  );
+}
 
-  const params = { base, q, maxIn, gas, flashBps, slip, limit, interval };
-  const { data, isLoading, refetch } = useAdvancedScan(params);
+function RouteCardSingle({
+  item,
+  addrToSymbol,
+}: {
+  item: {
+    pair: string;
+    pathTokens: `0x${string}`[];
+    dexes: string[];
+    size: string;
+    net: string;
+    netBps: number;
+    pnlPerGas?: number;
+  };
+  addrToSymbol: (a: string) => string;
+}) {
+  const [size, setSize] = useState(item.size);
+  const colorBps = item.netBps >= 0 ? "text-emerald-400" : "text-rose-400";
+  const fmtPct = (bps: number) => `${(bps / 100).toFixed(2)}%`;
+
+  const pathReadable = useMemo(
+    () => item.pathTokens.map(addrToSymbol).join(" / "),
+    [item.pathTokens, addrToSymbol]
+  );
 
   return (
-    <div className="p-6 space-y-6">
-      <h1 className="text-2xl font-semibold">Advanced Scanner (Polygon — Live)</h1>
+    <div className="rounded-2xl bg-slate-900/60 border border-slate-700 p-4 flex flex-col gap-2">
+      <div className="flex items-center justify-between">
+        <div className="font-semibold">{pathReadable}</div>
+        <div className="text-xs text-slate-400">route</div>
+      </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-8 gap-3">
-        <label className="flex flex-col">
-          <span className="text-sm text-neutral-400 mb-1">Base</span>
-          <select value={base} onChange={e=>setBase(e.target.value)} className="px-3 py-2 rounded-xl bg-neutral-900 border border-neutral-800">
+      <div className="grid grid-cols-2 gap-2 text-sm">
+        <div className="flex items-center justify-between">
+          <div>best size:</div>
+          <div className="font-mono">{item.size}</div>
+        </div>
+        <div className="flex items-center justify-between">
+          <div>net:</div>
+          <div className="font-mono">{item.net}</div>
+        </div>
+        <div className="flex items-center justify-between">
+          <div>dexes:</div>
+          <div className="font-mono">{item.dexes.join(" → ")}</div>
+        </div>
+        <div className="flex items-center justify-between">
+          <div>pnl/gas:</div>
+          <div className="font-mono">{(item.pnlPerGas ?? 0).toFixed(3)}</div>
+        </div>
+      </div>
+
+      <div className={`text-sm font-semibold ${colorBps}`}>
+        net bps: {fmtPct(item.netBps)}
+      </div>
+
+      <div className="mt-2">
+        <input
+          type="range"
+          min="1"
+          max={item.size}
+          defaultValue={item.size}
+          className="w-full"
+          onChange={(e) => setSize(e.target.value)}
+        />
+        <div className="text-xs text-right text-slate-400">size: {size}</div>
+      </div>
+
+      <div className="mt-1 flex gap-2">
+        <button
+          className="px-3 py-1.5 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-sm"
+          onClick={() => {
+            const obj = { type: "single", ...item, sizeOverride: size };
+            navigator.clipboard.writeText(JSON.stringify(obj, null, 2));
+          }}
+        >
+          Copy JSON
+        </button>
+        <button
+          className="px-3 py-1.5 rounded-xl bg-purple-600 hover:bg-purple-500 text-white text-sm"
+          onClick={() =>
+            alert("Hook this to your /api/txs simulate endpoint for a preview.")
+          }
+        >
+          Test
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function RouteCardMulti({
+  item,
+  addrToSymbol,
+}: {
+  item: {
+    path: string;
+    pathTokens: `0x${string}`[];
+    dexes: string[];
+    bestSize: string;
+    net: string;
+    netBps: number;
+    pnlPerGas?: number;
+  };
+  addrToSymbol: (a: string) => string;
+}) {
+  const [size, setSize] = useState(item.bestSize);
+  const colorBps = item.netBps >= 0 ? "text-emerald-400" : "text-rose-400";
+  const fmtPct = (bps: number) => `${(bps / 100).toFixed(2)}%`;
+
+  const pathReadable = useMemo(
+    () => item.pathTokens.map(addrToSymbol).join(" / "),
+    [item.pathTokens, addrToSymbol]
+  );
+
+  return (
+    <div className="rounded-2xl bg-slate-900/60 border border-slate-700 p-4 flex flex-col gap-2">
+      <div className="flex items-center justify-between">
+        <div className="font-semibold">{pathReadable}</div>
+        <div className="text-xs text-slate-400">route</div>
+      </div>
+
+      <div className="grid grid-cols-2 gap-2 text-sm">
+        <div className="flex items-center justify-between">
+          <div>best size:</div>
+          <div className="font-mono">{item.bestSize}</div>
+        </div>
+        <div className="flex items-center justify-between">
+          <div>net:</div>
+          <div className="font-mono">{item.net}</div>
+        </div>
+        <div className="flex items-center justify-between">
+          <div>dexes:</div>
+          <div className="font-mono">{item.dexes.join(" → ")}</div>
+        </div>
+        <div className="flex items-center justify-between">
+          <div>pnl/gas:</div>
+          <div className="font-mono">{(item.pnlPerGas ?? 0).toFixed(3)}</div>
+        </div>
+      </div>
+
+      <div className={`text-sm font-semibold ${colorBps}`}>
+        net bps: {fmtPct(item.netBps)}
+      </div>
+
+      <div className="mt-2">
+        <input
+          type="range"
+          min="1"
+          max={item.bestSize}
+          defaultValue={item.bestSize}
+          className="w-full"
+          onChange={(e) => setSize(e.target.value)}
+        />
+        <div className="text-xs text-right text-slate-400">size: {size}</div>
+      </div>
+
+      <div className="mt-1 flex gap-2">
+        <button
+          className="px-3 py-1.5 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-sm"
+          onClick={() => {
+            const obj = { type: "multi", ...item, sizeOverride: size };
+            navigator.clipboard.writeText(JSON.stringify(obj, null, 2));
+          }}
+        >
+          Copy JSON
+        </button>
+        <button
+          className="px-3 py-1.5 rounded-xl bg-purple-600 hover:bg-purple-500 text-white text-sm"
+          onClick={() =>
+            alert("Hook this to your /api/txs simulate endpoint for a preview.")
+          }
+        >
+          Test
+        </button>
+      </div>
+    </div>
+  );
+}
+
+export default function AdvancedScannerPage() {
+  // Controls
+  const [base, setBase] = useState("WMATIC");
+  const [maxIn, setMaxIn] = useState("5");   // base units
+  const [maxHops, setMaxHops] = useState("4");
+
+  // Show down to -5.00% and include ≤0 PnL for testing
+  const { data, isLoading, error, url } = useAdvancedScan({
+    base,
+    maxIn,
+    maxHops,
+    minBps: "-500",    // allow negative (e.g., -5.00%)
+    profitable: "0",   // include zero/negative for testing
+  });
+
+  const ts = useMemo(() => {
+    if (!data?.ts) return "-";
+    const d = new Date(data.ts * 1000);
+    return d.toLocaleString();
+  }, [data?.ts]);
+
+  const addrToSymbol = useMemo(() => makeAddrToSymbol(), []);
+
+  const thresholdPct = useMemo(() => {
+    const bps = Number(data?.filters?.minBps ?? 150);
+    return (bps / 100).toFixed(2);
+  }, [data?.filters?.minBps]);
+
+  return (
+    <div className="min-h-screen bg-slate-950 text-slate-100 p-6">
+      <h1 className="text-2xl font-bold mb-6">Polygon Arbitrage Scanner (Pro, up to 4 hops)</h1>
+
+      {/* Top controls / tiles */}
+      <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-4 gap-4 mb-6">
+        <div className="bg-slate-900/60 border border-slate-800 rounded-2xl p-4">
+          <div className="text-xs text-slate-400 mb-2">Base Token</div>
+          <select
+            className="w-full bg-slate-800 rounded-xl px-3 py-2"
+            value={base}
+            onChange={(e) => setBase(e.target.value.toUpperCase())}
+          >
             <option>WMATIC</option>
+            <option>USDC</option>
+            <option>USDT</option>
+            <option>WETH</option>
+            <option>WBTC</option>
           </select>
-        </label>
 
-        <label className="flex flex-col md:col-span-3">
-          <span className="text-sm text-neutral-400 mb-1">Quote CSV (universe)</span>
-          <input value={q} onChange={e=>setQ(e.target.value)} className="px-3 py-2 rounded-xl bg-neutral-900 border border-neutral-800" placeholder="USDC,WETH,DAI,..." />
-        </label>
+          <div className="text-xs text-slate-400 mt-4 mb-1">Max In (base units)</div>
+          <input
+            className="w-full bg-slate-800 rounded-xl px-3 py-2"
+            value={maxIn}
+            onChange={(e) => setMaxIn(e.target.value)}
+          />
 
-        <label className="flex flex-col">
-          <span className="text-sm text-neutral-400 mb-1">Max In (base)</span>
-          <input value={maxInUi} onChange={e=>setMaxInUi(e.target.value)} className="px-3 py-2 rounded-xl bg-neutral-900 border border-neutral-800" />
-        </label>
+          <div className="text-xs text-slate-400 mt-4 mb-1">Max Hops</div>
+          <select
+            className="w-full bg-slate-800 rounded-xl px-3 py-2"
+            value={maxHops}
+            onChange={(e) => setMaxHops(e.target.value)}
+          >
+            <option value="2">2</option>
+            <option value="3">3</option>
+            <option value="4">4</option>
+          </select>
 
-        <label className="flex flex-col">
-          <span className="text-sm text-neutral-400 mb-1">Gas (gwei)</span>
-          <input value={gas} onChange={e=>setGas(e.target.value)} className="px-3 py-2 rounded-xl bg-neutral-900 border border-neutral-800" />
-        </label>
+          <button
+            className="mt-4 w-full rounded-xl bg-sky-600 hover:bg-sky-500 py-2 font-semibold"
+            onClick={() => window.location.assign(`/advanced?base=${base}&maxIn=${maxIn}&maxHops=${maxHops}`)}
+          >
+            Scan Now
+          </button>
+        </div>
 
-        <label className="flex flex-col">
-          <span className="text-sm text-neutral-400 mb-1">Flash fee (bps)</span>
-          <input value={flashBps} onChange={e=>setFlashBps(e.target.value)} className="px-3 py-2 rounded-xl bg-neutral-900 border border-neutral-800" />
-        </label>
-
-        <label className="flex flex-col">
-          <span className="text-sm text-neutral-400 mb-1">Slippage (bps)</span>
-          <input value={slip} onChange={e=>setSlip(e.target.value)} className="px-3 py-2 rounded-xl bg-neutral-900 border border-neutral-800" />
-        </label>
+        <HeaderTile label="Last Scan" value={ts} />
+        <HeaderTile label="Status" value={isLoading ? "Scanning…" : error ? "Error" : "Ready"} />
+        <HeaderTile
+          label="Request"
+          value={<div className="text-xs break-all text-slate-400">{url}</div>}
+        />
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-6 gap-3">
-        <label className="flex flex-col">
-          <span className="text-sm text-neutral-400 mb-1">Results</span>
-          <select value={limit} onChange={e=>setLimit(e.target.value)} className="px-3 py-2 rounded-xl bg-neutral-900 border border-neutral-800">
-            {['10','20','50','100','250'].map(n => <option key={n} value={n}>{n}</option>)}
-          </select>
-        </label>
-        <label className="flex flex-col">
-          <span className="text-sm text-neutral-400 mb-1">Refresh</span>
-          <select value={interval} onChange={e=>setInterval(e.target.value)} className="px-3 py-2 rounded-xl bg-neutral-900 border border-neutral-800">
-            <option value="5000">5s</option>
-            <option value="10000">10s</option>
-            <option value="20000">20s</option>
-            <option value="60000">60s</option>
-          </select>
-        </label>
-        <div className="flex items-end">
-          <button onClick={()=>refetch()} className="px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-500">{isLoading ? 'Scanning…' : 'Scan'}</button>
+      {/* Results */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        {/* Single-hop */}
+        <div className="rounded-2xl border border-slate-800 bg-slate-900/40 p-4">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-lg font-semibold">
+              Single-hop opportunities (≥ {thresholdPct}% net)
+            </h3>
+          </div>
+          <div className="flex flex-col gap-3">
+            {(data?.single ?? []).map((it: any, i: number) => (
+              <RouteCardSingle key={i} item={it} addrToSymbol={addrToSymbol} />
+            ))}
+            {!data?.single?.length && (
+              <div className="text-sm text-slate-400">
+                No single-hop routes at current filter.
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Multi-hop */}
+        <div className="rounded-2xl border border-slate-800 bg-slate-900/40 p-4">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-lg font-semibold">
+              Multi-hop opportunities (≤ {maxHops} hops, ≥ {thresholdPct}% net)
+            </h3>
+          </div>
+          <div className="flex flex-col gap-3">
+            {(data?.multi ?? []).map((it: any, i: number) => (
+              <RouteCardMulti key={i} item={it} addrToSymbol={addrToSymbol} />
+            ))}
+            {!data?.multi?.length && (
+              <div className="text-sm text-slate-400">
+                No multi-hop routes at current filter.
+              </div>
+            )}
+          </div>
         </div>
       </div>
 
-      <div className="grid md:grid-cols-2 gap-6">
-        <div className="border border-neutral-800 rounded-2xl overflow-hidden">
-          <div className="p-3 bg-neutral-900 font-medium">Single-hop</div>
-          <table className="w-full text-sm">
-            <thead><tr className="text-left"><th className="p-3">Route</th><th className="p-3">Pair</th><th className="p-3 text-right">Best Size</th><th className="p-3 text-right">Net (base)</th></tr></thead>
-            <tbody>
-              {isLoading && (<tr><td className="p-3" colSpan={4}>Scanning…</td></tr>)}
-              {!isLoading && (!data?.single || data.single.length===0) && (<tr><td className="p-3" colSpan={4}>No profitable single-hop routes.</td></tr>)}
-              {data?.single?.map((r:any,i:number)=>(
-                <tr key={i} className="border-t border-neutral-800">
-                  <td className="p-3">{r.route}</td>
-                  <td className="p-3">{r.base}/{r.quote}</td>
-                  <td className="p-3 text-right">{human(r.bestIn)}</td>
-                  <td className="p-3 text-right">{human(r.net)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-
-        <div className="border border-neutral-800 rounded-2xl overflow-hidden">
-          <div className="p-3 bg-neutral-900 font-medium">Multi-hop (≤2)</div>
-          <table className="w-full text-sm">
-            <thead><tr className="text-left"><th className="p-3">Path</th><th className="p-3 text-right">Best Size</th><th className="p-3 text-right">Net (base)</th></tr></thead>
-            <tbody>
-              {isLoading && (<tr><td className="p-3" colSpan={3}>Scanning…</td></tr>)}
-              {!isLoading && (!data?.multi || data.multi.length===0) && (<tr><td className="p-3" colSpan={3}>No profitable multi-hop routes.</td></tr>)}
-              {data?.multi?.map((r:any,i:number)=>(
-                <tr key={i} className="border-t border-neutral-800">
-                  <td className="p-3">{r.path}</td>
-                  <td className="p-3 text-right">{human(r.bestIn)}</td>
-                  <td className="p-3 text-right">{human(r.net)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+      <div className="mt-6 text-center text-xs text-slate-500">
+        Auto-scans every 30s • Threshold is dynamic from API • Liquidity-aware mids • Up to 4 hops
       </div>
     </div>
   );

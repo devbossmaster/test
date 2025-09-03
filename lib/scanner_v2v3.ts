@@ -1,500 +1,799 @@
-import { getPublicClient } from './viemClient';
-import type { SupportedChain } from './viemClient';
-import type { Address, PublicClient } from 'viem';
-import { V2_FACTORY_ABI, V2_PAIR_ABI } from './abis/v2';
-import { V2_FACTORY_EVENT_ABI, ERC20_ABI_MIN } from './abis/common';
-import { POLYGON_V2_DEXS } from './dexConfigs';
-import { V3_POLYGON, QS_V3_POLYGON } from './dexV3Configs';
-import { quoteV2Single, quoteV3Single } from './quote';
-import { quoteAlgebraSingle } from './quoteAlgebra';
-import { buildKHopPaths, simulatePathWithSlippage, type Edge } from './graph';
-// NEW (dynamic discovery)
+// lib/scanner_v2v3.ts
+// Pro-grade Polygon/Mainnet arb scanner core.
+// - V2 discovery via multicall (batched, index-safe)
+// - Optional V3 quoter best-of
+// - Liquidity-aware mid-token selection
+// - Path search up to 4 hops (uses ./graph)
+// - Golden-section(ish) sizing on BigInt
+// - Returns per-path token list + per-leg chosen DEX keys for clear UI
 
-export type Token = { symbol: string; address: Address; decimals: number };
+import {
+  Address,
+  createPublicClient,
+  getAddress,
+  http,
+} from "viem";
+import { polygon } from "viem/chains";
+import {
+  buildKHopPaths,
+  simulatePathWithSlippage,
+  type Edge,
+} from "./graph";
+
+// ---------- Exported types ----------
+export type Token = {
+  address: `0x${string}`;
+  symbol: string;
+  decimals: number;
+};
+
+export type V2Dex = {
+  key: string;          // e.g. "quickswap_v2"
+  factory: Address;     // factory address
+  feeBps?: number;      // default 30 bps if omitted
+};
+
+export type V3Dex = {
+  key: string;          // e.g. "uniswap_v3"
+  quoter: Address;      // quoter (or algebra quoter) address
+  feeTiers: number[];   // e.g. [500, 3000, 10000]
+};
 
 export type AdvancedScanCfg = {
-  chain?: SupportedChain;
+  chain: "polygon" | "mainnet";
   base: Token;
-  quoteCandidates?: Token[];
-  discoverAll?: boolean;
-  maxDiscover?: number;
+  universe: Token[];
   amountInBaseMax: bigint;
-  gasPriceWei?: bigint;
-  priorityFeeWei?: bigint;
-  flashFeeBps: number;
-  maxHops?: 2 | 3;
-  maxSlippageBps?: number;
-  onlyProfitable?: boolean;
+
+  v2Dexes: V2Dex[];
+  v3Dexes?: V3Dex[];
+
+  slippageBps?: number;           // default 30
+  flashFeeBps?: number;           // default 9
+  minNetBps?: number;             // default 150 (1.5%). Can be negative/zero.
   minNetBase?: bigint;
-  minNetBps?: number;
-  dexAllow?: string[];
-  minBaseReserve?: bigint;
-  minBaseReserveUsd?: number;   // USD screen for base-side pool depth
+  onlyProfitable?: boolean;       // default true
+  maxHops?: 2 | 3 | 4;            // default 3
+
+  gasGwei?: number;
+  priorityGwei?: number;
   maxStaleSec?: number;
+
   bridgeSymbols?: string[];
-  discoverWindowBlocks?: number;
+  dexAllow?: string[];
 };
 
-// helpers
-const DEN = 10_000n;
-const toBps = (num: bigint, deno: bigint) => Number((num * 10_000n) / (deno || 1n));
-const lc = (a: Address) => a.toLowerCase() as Address;
+// ---------- Minimal ABIs ----------
+const UNI_V2_FACTORY_ABI = [
+  {
+    type: "function",
+    name: "getPair",
+    stateMutability: "view",
+    inputs: [
+      { name: "tokenA", type: "address" },
+      { name: "tokenB", type: "address" },
+    ],
+    outputs: [{ name: "pair", type: "address" }],
+  },
+] as const;
 
-type V2Pool = {
-  dexKey: string; token0: Address; token1: Address;
-  reserve0: bigint; reserve1: bigint; feeBps: number; ts: number;
+const UNI_V2_PAIR_ABI = [
+  {
+    type: "function",
+    name: "getReserves",
+    stateMutability: "view",
+    inputs: [],
+    outputs: [
+      { name: "_reserve0", type: "uint112" },
+      { name: "_reserve1", type: "uint112" },
+      { name: "_blockTimestampLast", type: "uint32" },
+    ],
+  },
+  {
+    type: "function",
+    name: "token0",
+    stateMutability: "view",
+    inputs: [],
+    outputs: [{ type: "address" }],
+  },
+  {
+    type: "function",
+    name: "token1",
+    stateMutability: "view",
+    inputs: [],
+    outputs: [{ type: "address" }],
+  },
+] as const;
+
+const UNI_V3_QUOTER_ABI = [
+  {
+    type: "function",
+    name: "quoteExactInputSingle",
+    stateMutability: "nonpayable",
+    inputs: [
+      {
+        name: "params",
+        type: "tuple",
+        components: [
+          { name: "tokenIn", type: "address" },
+          { name: "tokenOut", type: "address" },
+          { name: "fee", type: "uint24" },
+          { name: "amountIn", type: "uint256" },
+          { name: "sqrtPriceLimitX96", type: "uint160" },
+        ],
+      },
+    ],
+    outputs: [{ name: "amountOut", type: "uint256" }],
+  },
+] as const;
+
+// ---------- Public client (accepts full URL or bare Alchemy key) ----------
+function normalizePolygonRpc(raw?: string | null): string {
+  if (!raw) return "https://polygon-rpc.com";
+  const v = raw.trim();
+  if (!v) return "https://polygon-rpc.com";
+  if (v.startsWith("http://") || v.startsWith("https://")) return v;
+  return `https://polygon-mainnet.g.alchemy.com/v2/${v}`;
+}
+
+const RPC_URL = normalizePolygonRpc(
+  process.env.NEXT_PUBLIC_ALCHEMY_POLYGON_URL ||
+    process.env.ALCHEMY_POLYGON_URL ||
+    process.env.POLYGON_RPC_URL ||
+    (process.env.ALCHEMY_KEY as any)
+);
+
+const client = createPublicClient({
+  chain: polygon,
+  transport: http(RPC_URL),
+});
+
+// ---------- Small utils ----------
+const lc = (a: Address | string) => (a as string).toLowerCase();
+const ZERO: Address = getAddress("0x0000000000000000000000000000000000000000");
+
+function getFeeBps(d?: V2Dex) {
+  return d?.feeBps ?? 30; // default 0.30%
+}
+
+// V2 constant product quote
+function getAmountOutV2(
+  amountIn: bigint,
+  reserveIn: bigint,
+  reserveOut: bigint,
+  feeBps = 30
+) {
+  if (amountIn <= 0n || reserveIn <= 0n || reserveOut <= 0n) return 0n;
+  const feeDen = 10_000n;
+  const amountInWithFee = (amountIn * (feeDen - BigInt(feeBps))) / feeDen;
+  const numerator = amountInWithFee * reserveOut;
+  const denominator = reserveIn + amountInWithFee;
+  return numerator / denominator;
+}
+
+// ---------- V2 discovery & quoting ----------
+type PairInfo = {
+  pair: Address;
+  token0: Address;
+  token1: Address;
+  reserve0: bigint;
+  reserve1: bigint;
 };
 
-// -------- discovery via V2 PairCreated logs ----------
-async function discoverTokensV2(
-  client: PublicClient,
-  factories: { key:string; factory: Address }[],
-  base: Token,
-  max: number,
-  windowBlocks: number
-): Promise<Token[]> {
-  const set = new Map<string, Token>();
-  set.set(lc(base.address), base);
+// Cache for factory.getPair
+const pairCache = new Map<string, Address>(); // key: `${factory}-${A}-${B}` (lc)
 
-  const latest = await client.getBlockNumber();
-  const from = latest > BigInt(windowBlocks) ? latest - BigInt(windowBlocks) : 0n;
+// SAFE, BATCHED discovery (fixes undefined res[index] cases)
+async function discoverV2Pairs(
+  tokens: Token[],
+  v2dexes: V2Dex[],
+  dexAllow?: string[]
+): Promise<Address[]> {
+  const allowed = dexAllow ? new Set(dexAllow.map((k) => k.toLowerCase())) : undefined;
 
-  for (const f of factories) {
-    try {
-      const logs = await client.getLogs({
-        address: f.factory,
-        fromBlock: from,
-        toBlock: latest,
-        events: V2_FACTORY_EVENT_ABI,
-      });
-      for (const lg of logs) {
-        const t0 = lc((lg as any).args.token0 as Address);
-        const t1 = lc((lg as any).args.token1 as Address);
-        if (!set.has(t0)) set.set(t0, { symbol: 'T0', address: t0, decimals: 18 } as Token);
-        if (!set.has(t1)) set.set(t1, { symbol: 'T1', address: t1, decimals: 18 } as Token);
-        if (set.size >= max) break;
-      }
-    } catch { /* ignore */ }
-    if (set.size >= max) break;
-  }
+  type Q = {
+    address: Address;
+    abi: typeof UNI_V2_FACTORY_ABI;
+    functionName: "getPair";
+    args: readonly [Address, Address];
+    k: string; // `${factory}-${A}-${B}`
+  };
 
-  // fetch decimals + symbol (best effort)
-  const entries = Array.from(set.values()).slice(0, Math.min(set.size, max));
-  await Promise.all(entries.map(async (t, i) => {
-    try {
-      const [dec, sym] = await Promise.all([
-        client.readContract({ address: t.address, abi: ERC20_ABI_MIN, functionName: 'decimals' }).catch(()=>18),
-        client.readContract({ address: t.address, abi: ERC20_ABI_MIN, functionName: 'symbol'   }).catch(()=>`TOK${i}`),
-      ]);
-      t.decimals = Number(dec as number ?? 18);
-      t.symbol = String(sym ?? `TOK${i}`);
-    } catch { /* keep defaults */ }
-  }));
+  const queries: Q[] = [];
 
-  return entries;
-}
+  for (const dex of v2dexes) {
+    if (allowed && !allowed.has(dex.key.toLowerCase())) continue;
+    const factory = getAddress(dex.factory);
+    for (let i = 0; i < tokens.length; i++) {
+      for (let j = i + 1; j < tokens.length; j++) {
+        const A = getAddress(tokens[i].address);
+        const B = getAddress(tokens[j].address);
+        const k1 = `${lc(factory)}-${lc(A)}-${lc(B)}`;
+        const k2 = `${lc(factory)}-${lc(B)}-${lc(A)}`;
 
-// ------- tiny USDC price for base, then USD screen -------
-async function priceBaseInUSDC(
-  client: PublicClient,
-  base: Token,
-  usdc: Token,
-  v3s: { cfg: { quoterV2?: Address; feeTiers: number[] }, kind: 'univ3'|'algebra' }[],
-  v2BestOut: (a: Address, b: Address, amt: bigint)=>bigint
-): Promise<number> {
-  const tiny = 10n ** BigInt(Math.max(0, base.decimals - 6)); // ~1e-6 base
-  let out: bigint = 0n;
-
-  for (const v of v3s) {
-    const outs: bigint[] = await Promise.all(v.cfg.feeTiers.map(async ft => {
-      if (v.kind === 'univ3') {
-        return await quoteV3Single(client, { quoterV2: v.cfg.quoterV2!, feeTiers:[ft] }, base.address, usdc.address, ft, tiny);
-      } else {
-        return await quoteAlgebraSingle(client, v.cfg.quoterV2, base.address, usdc.address, tiny);
-      }
-    }));
-    const best = outs.reduce<bigint>((a,b)=> a>b ? a : b, 0n);
-    if (best > out) out = best;
-  }
-
-  if (out === 0n) out = v2BestOut(base.address, usdc.address, tiny);
-  if (out === 0n) return 0;
-
-  const outFloat = Number(out) / Number(10n ** BigInt(usdc.decimals));
-  const inFloat  = Number(tiny) / Number(10n ** BigInt(base.decimals));
-  return outFloat / inFloat; // USDC per 1 base
-}
-
-// ------- Golden-section optimizer (bigint-safe) -------
-async function maximizeOverSize(
-  f: (x: bigint)=>Promise<bigint>,
-  lo: bigint,
-  hi: bigint,
-  iters = 12
-): Promise<{ size: bigint; value: bigint }> {
-  if (hi <= lo) return { size: lo, value: await f(lo) };
-  const SCALE = 1_000_000_000n;
-  const R = 618_033_989n; // ~0.618 * 1e9
-
-  let a = lo, b = hi;
-  let x1 = a + ((b - a) * (SCALE - R)) / SCALE;
-  let x2 = a + ((b - a) * R) / SCALE;
-  let f1 = await f(x1);
-  let f2 = await f(x2);
-
-  for (let i = 0; i < iters; i++) {
-    if (f1 < f2) {
-      a = x1; x1 = x2; f1 = f2;
-      x2 = a + ((b - a) * R) / SCALE;
-      f2 = await f(x2);
-    } else {
-      b = x2; x2 = x1; f2 = f1;
-      x1 = a + ((b - a) * (SCALE - R)) / SCALE;
-      f1 = await f(x1);
-    }
-  }
-  return (f1 > f2) ? { size:x1, value:f1 } : { size:x2, value:f2 };
-}
-
-// ================== MAIN SCANNER =========================
-export async function scanAdvancedSingleAndMulti(cfg: AdvancedScanCfg) {
-  const chain = cfg.chain ?? 'polygon';
-  const client = getPublicClient(chain);
-
-  const uniV3 = V3_POLYGON;
-  const qsV3  = QS_V3_POLYGON.quoterV2 !== ('0x0000000000000000000000000000000000000000' as Address)
-              ? QS_V3_POLYGON : undefined;
-
-  // EIP-1559 gas (fallback ~30 + 3 gwei)
-  let gasPriceWei = cfg.gasPriceWei;
-  if (!gasPriceWei) {
-    const blk = await client.getBlock();
-    const base = blk.baseFeePerGas ?? 30_000_000_000n;
-    const tip  = cfg.priorityFeeWei ?? 3_000_000_000n;
-    gasPriceWei = base + tip;
-  }
-
-  // V2 allowlist
-  let v2Dexes = POLYGON_V2_DEXS;
-  if (cfg.dexAllow?.length) {
-    const allow = new Set(cfg.dexAllow.map(s => s.toLowerCase()));
-    v2Dexes = v2Dexes.filter(d => allow.has(d.key.toLowerCase()));
-  }
-
-  // Token universe (manual + discovery)
-  let universe: Token[] = [cfg.base, ...(cfg.quoteCandidates ?? [])];
-  if (cfg.discoverAll) {
-    const discovered = await discoverTokensV2(
-      client,
-      v2Dexes.map(d => ({ key:d.key, factory:d.factory })),
-      cfg.base,
-      Math.max(25, Math.min(cfg.maxDiscover ?? 250, 1000)),
-      cfg.discoverWindowBlocks ?? 500_000
-    );
-    const seen = new Set(universe.map(t => lc(t.address)));
-    for (const t of discovered) {
-      const key = lc(t.address);
-      if (!seen.has(key)) { universe.push(t); seen.add(key); }
-    }
-  }
-
-  // Build unordered pairs for V2 probes
-  const addrLc = (a: Address) => a.toLowerCase();
-  const unorderedPairs: [Token, Token][] = [];
-  for (let i = 0; i < universe.length; i++) {
-    for (let j = i + 1; j < universe.length; j++) unorderedPairs.push([universe[i], universe[j]]);
-  }
-
-  // ---- V2 pair map
-  const v2Pools: Record<string, V2Pool[]> = {};
-  const pairCalls: any[] = []; const meta: any[] = [];
-  for (const dex of v2Dexes) for (const [A,B] of unorderedPairs) {
-    const t0 = addrLc(A.address) < addrLc(B.address) ? A.address : B.address;
-    const t1 = (t0 === A.address) ? B.address : A.address;
-    pairCalls.push({ address: dex.factory, abi: V2_FACTORY_ABI, functionName: 'getPair', args: [t0, t1] });
-    meta.push({ dex, t0, t1 });
-  }
-
-  const pairRes = await client.multicall({ allowFailure: true, contracts: pairCalls });
-  const havePairs: { addr: Address; dexKey: string; t0: Address; t1: Address }[] = [];
-  pairRes.forEach((r,i) => {
-    if (r?.status === 'success' && r.result !== '0x0000000000000000000000000000000000000000') {
-      havePairs.push({ addr: r.result as Address, dexKey: meta[i].dex.key, t0: meta[i].t0, t1: meta[i].t1 });
-    }
-  });
-
-  const reads = await Promise.all(havePairs.map(n => Promise.all([
-    client.readContract({ address: n.addr, abi: V2_PAIR_ABI, functionName: 'token0' }),
-    client.readContract({ address: n.addr, abi: V2_PAIR_ABI, functionName: 'token1' }),
-    client.readContract({ address: n.addr, abi: V2_PAIR_ABI, functionName: 'getReserves' }),
-  ])));
-
-  reads.forEach((rr,i) => {
-    const token0 = rr[0] as Address, token1 = rr[1] as Address; const g = rr[2] as any;
-    const key = `${token0}-${token1}`.toLowerCase();
-    const pool: V2Pool = {
-      dexKey: havePairs[i].dexKey,
-      token0, token1,
-      reserve0: BigInt(g[0]), reserve1: BigInt(g[1]),
-      ts: Number(g[2]), feeBps: 30
-    };
-    (v2Pools[key] = v2Pools[key] || []).push(pool);
-  });
-
-  // staleness filter
-  if (cfg.maxStaleSec && cfg.maxStaleSec > 0) {
-    const nowSec = Math.floor(Date.now()/1000);
-    for (const k of Object.keys(v2Pools)) {
-      v2Pools[k] = v2Pools[k].filter(p => (nowSec - p.ts) <= cfg.maxStaleSec!);
-      if (!v2Pools[k].length) delete v2Pools[k];
-    }
-  }
-
-  // v2 best-of helper + optional base-side reserve
-  const minBaseReserve = cfg.minBaseReserve ?? 0n;
-  function bestV2Out(inToken: Address, outToken: Address, amt: bigint): bigint {
-    const key1 = `${inToken}-${outToken}`.toLowerCase();
-    const key2 = `${outToken}-${inToken}`.toLowerCase();
-    const pools = [...(v2Pools[key1]||[]), ...(v2Pools[key2]||[])];
-    let best = 0n;
-    for (const p of pools) {
-      const isBaseSide = addrLc(inToken) === addrLc(cfg.base.address) || addrLc(outToken) === addrLc(cfg.base.address);
-      if (isBaseSide && minBaseReserve > 0n) {
-        const baseReserve = addrLc(cfg.base.address) === addrLc(p.token0) ? p.reserve0
-                           : addrLc(cfg.base.address) === addrLc(p.token1) ? p.reserve1 : 0n;
-        if (baseReserve && baseReserve < minBaseReserve) continue;
-      }
-      const out = quoteV2Single(
-        { dex:{ key:p.dexKey, label:p.dexKey, factory:'0x0000000000000000000000000000000000000000' as Address, feeBps:p.feeBps }, token0:p.token0, token1:p.token1, reserve0:p.reserve0, reserve1:p.reserve1 },
-        inToken, outToken, amt
-      );
-      if (out > best) best = out;
-    }
-    return best;
-  }
-
-  // USD depth screen on base-side pools (optional but recommended)
-  let minUsdOK: (p: V2Pool) => boolean = () => true;
-  if (cfg.minBaseReserveUsd && cfg.minBaseReserveUsd > 0) {
-    const USDC =
-      universe.find(t => t.symbol.toUpperCase().includes('USDC')) ??
-      { symbol:'USDC', address:'0x2791bca1f2de4661ed88a30c99a7a9449aa84174' as Address, decimals:6 };
-
-    const priceBaseUsd = await priceBaseInUSDC(
-      client, cfg.base, USDC,
-      [
-        { cfg: uniV3, kind:'univ3' as const },
-        ...(qsV3 ? [{ cfg: qsV3, kind:'algebra' as const }] : [])
-      ],
-      bestV2Out
-    );
-
-    minUsdOK = (p: V2Pool) => {
-      const baseReserve = addrLc(cfg.base.address) === addrLc(p.token0) ? p.reserve0
-                        : addrLc(cfg.base.address) === addrLc(p.token1) ? p.reserve1 : 0n;
-      if (baseReserve === 0n) return true; // not a base pool
-      const baseUnits = Number(baseReserve) / Number(10n ** BigInt(cfg.base.decimals));
-      const usd = baseUnits * priceBaseUsd;
-      return usd >= cfg.minBaseReserveUsd!;
-    };
-
-    for (const k of Object.keys(v2Pools)) {
-      v2Pools[k] = v2Pools[k].filter(minUsdOK);
-      if (!v2Pools[k].length) delete v2Pools[k];
-    }
-  }
-
-  // ---- Single-hop scanning (with optimizer)
-  const gasUnitsTwoLeg = 350_000n;
-  const slippageBps = cfg.maxSlippageBps ?? 10;
-  const flashFeeBps = BigInt(cfg.flashFeeBps);
-
-  async function bestNetForMix(q: Token, buy: 'v2'|'v3u'|'v3q', size: bigint): Promise<bigint> {
-    let qOut: bigint = 0n;
-    if (buy === 'v2') {
-      qOut = bestV2Out(cfg.base.address, q.address, size);
-    } else if (buy === 'v3u') {
-      const outs: bigint[] = await Promise.all(uniV3.feeTiers.map((f)=>quoteV3Single(client, uniV3, cfg.base.address, q.address, f, size)));
-      qOut = outs.reduce<bigint>((a,b)=>a>b?a:b, 0n);
-    } else {
-      const out = await quoteAlgebraSingle(client, QS_V3_POLYGON.quoterV2, cfg.base.address, q.address, size);
-      qOut = out;
-    }
-    qOut -= (qOut * BigInt(slippageBps)) / DEN;
-
-    const sellCandidates: Array<Promise<bigint>> = [];
-    sellCandidates.push(Promise.resolve(bestV2Out(q.address, cfg.base.address, qOut)));
-    sellCandidates.push((async ()=> {
-      const outs: bigint[] = await Promise.all(uniV3.feeTiers.map((f)=>quoteV3Single(client, uniV3, q.address, cfg.base.address, f, qOut)));
-      return outs.reduce<bigint>((a,b)=>a>b?a:b, 0n);
-    })());
-    if (QS_V3_POLYGON.quoterV2) {
-      sellCandidates.push(quoteAlgebraSingle(client, QS_V3_POLYGON.quoterV2, q.address, cfg.base.address, qOut));
-    }
-
-    let back = (await Promise.all(sellCandidates)).reduce<bigint>((a,b)=>a>b?a:b, 0n);
-    back -= (back * BigInt(slippageBps)) / DEN;
-
-    const gasCost = (gasPriceWei!) * gasUnitsTwoLeg;
-    const flash = (size * flashFeeBps) / DEN;
-    return back - size - flash - gasCost;
-  }
-
-  const candidateQs = (cfg.quoteCandidates?.length ? cfg.quoteCandidates : universe)
-    .filter(t => lc(t.address) !== lc(cfg.base.address));
-  const single: any[] = [];
-
-  const sampleSizes = [1n, 2n, 5n, 10n].map(v => v * 10n**BigInt(cfg.base.decimals))
-                                        .filter(v => v <= cfg.amountInBaseMax);
-
-  for (const q of candidateQs) {
-    for (const buy of ['v2','v3u','v3q'] as const) {
-      if (buy === 'v3q' && !QS_V3_POLYGON.quoterV2) continue;
-
-      for (const sz of sampleSizes) {
-        const baseNet = await bestNetForMix(q, buy, sz);
-        const netBps = toBps(baseNet, sz);
-        const passProf = (cfg.onlyProfitable !== false) ? (baseNet > 0n) : true;
-        const passNet  = cfg.minNetBase ? baseNet >= cfg.minNetBase : true;
-        const passBps  = cfg.minNetBps ? netBps >= cfg.minNetBps : true;
-
-        if (passProf && passNet && passBps) {
-          const lo = (sz / 5n) > 0n ? (sz / 5n) : 1n;
-          const hi = (5n*sz <= cfg.amountInBaseMax) ? 5n*sz : cfg.amountInBaseMax;
-          const opt = await maximizeOverSize((x)=>bestNetForMix(q, buy, x), lo, hi, 10);
-          const pnlPerGas = Number(opt.value) / Number((gasPriceWei! * gasUnitsTwoLeg) || 1n);
-          single.push({
-            route: `${buy.toUpperCase()}→BEST`,
-            pair: `${cfg.base.symbol}/${q.symbol}`,
-            bestSize: opt.size.toString(),
-            net: opt.value.toString(),
-            netBps: toBps(opt.value, opt.size),
-            pnlPerGas
+        if (!pairCache.has(k1)) {
+          queries.push({
+            address: factory,
+            abi: UNI_V2_FACTORY_ABI,
+            functionName: "getPair",
+            args: [A, B],
+            k: k1,
           });
-          break;
+        }
+        if (!pairCache.has(k2)) {
+          queries.push({
+            address: factory,
+            abi: UNI_V2_FACTORY_ABI,
+            functionName: "getPair",
+            args: [B, A],
+            k: k2,
+          });
         }
       }
     }
   }
 
-  // ---- Multi-hop (≤3) edges
-  const bridges = new Set((cfg.bridgeSymbols && cfg.bridgeSymbols.length ? cfg.bridgeSymbols : ['USDC','WETH','DAI']).map(s=>s.toUpperCase()));
-  const bridgeAddrs = new Set(
-    universe.filter(t => bridges.has(t.symbol.toUpperCase())).map(t => t.address.toLowerCase())
-  );
+  if (queries.length) {
+    const BATCH = 1024;
+    for (let i = 0; i < queries.length; i += BATCH) {
+      const slice = queries.slice(i, i + BATCH);
+      const res = await client.multicall({
+        contracts: slice.map(({ k, ...call }) => call),
+        allowFailure: true,
+      });
+
+      for (let j = 0; j < res.length; j++) {
+        const out = res[j];
+        const q = slice[j];
+        const addr = out && out.status === "success" ? (out.result as Address) : ZERO;
+        pairCache.set(q.k, addr && lc(addr) !== lc(ZERO) ? getAddress(addr) : ZERO);
+      }
+    }
+  }
+
+  // Consolidate discovered pair addresses for keys we care about
+  const discovered = new Set<Address>();
+  for (const dex of v2dexes) {
+    if (allowed && !allowed.has(dex.key.toLowerCase())) continue;
+    const factory = getAddress(dex.factory);
+    for (let i = 0; i < tokens.length; i++) {
+      for (let j = i + 1; j < tokens.length; j++) {
+        const A = getAddress(tokens[i].address);
+        const B = getAddress(tokens[j].address);
+        const k1 = `${lc(factory)}-${lc(A)}-${lc(B)}`;
+        const k2 = `${lc(factory)}-${lc(B)}-${lc(A)}`;
+        const p1 = pairCache.get(k1);
+        const p2 = pairCache.get(k2);
+        if (p1 && lc(p1) !== lc(ZERO)) discovered.add(getAddress(p1));
+        if (p2 && lc(p2) !== lc(ZERO)) discovered.add(getAddress(p2));
+      }
+    }
+  }
+
+  return [...discovered];
+}
+
+async function readV2PairsInfo(pairs: Address[]): Promise<Map<Address, PairInfo>> {
+  const infos = new Map<Address, PairInfo>();
+  if (!pairs.length) return infos;
+
+  const t0Calls = pairs.map((p) => ({
+    address: p,
+    abi: UNI_V2_PAIR_ABI,
+    functionName: "token0" as const,
+    args: [] as const,
+  }));
+  const t1Calls = pairs.map((p) => ({
+    address: p,
+    abi: UNI_V2_PAIR_ABI,
+    functionName: "token1" as const,
+    args: [] as const,
+  }));
+  const rCalls = pairs.map((p) => ({
+    address: p,
+    abi: UNI_V2_PAIR_ABI,
+    functionName: "getReserves" as const,
+    args: [] as const,
+  }));
+
+  const [t0Res, t1Res, rRes] = await Promise.all([
+    client.multicall({ contracts: t0Calls, allowFailure: true }),
+    client.multicall({ contracts: t1Calls, allowFailure: true }),
+    client.multicall({ contracts: rCalls, allowFailure: true }),
+  ]);
+
+  for (let i = 0; i < pairs.length; i++) {
+    const pair = pairs[i];
+    const a = t0Res[i];
+    const b = t1Res[i];
+    const r = rRes[i];
+    if (!a || !b || !r) continue;
+    if (a.status !== "success" || b.status !== "success" || r.status !== "success") continue;
+
+    const token0 = getAddress(a.result as Address);
+    const token1 = getAddress(b.result as Address);
+    const [reserve0, reserve1] = r.result as unknown as [bigint, bigint, number];
+
+    infos.set(pair, { pair, token0, token1, reserve0, reserve1 });
+  }
+
+  return infos;
+}
+
+// ---------- Liquidity scoring (stable-side reserves) ----------
+function buildLiquidityScoresFromStableSides(
+  tokenList: Token[],
+  stableAddrsLc: Set<string>,
+  v2dexes: V2Dex[],
+  dexAllow?: string[]
+) {
+  const allowed = dexAllow ? new Set(dexAllow.map((k) => k.toLowerCase())) : undefined;
+  const scores = new Map<string, bigint>(); // tokenAddrLc -> sum of stable-side reserves
+  const push = (addrLc: string, inc: bigint) =>
+    scores.set(addrLc, (scores.get(addrLc) ?? 0n) + inc);
+
+  return {
+    async compute(): Promise<Map<string, bigint>> {
+      const stables = tokenList.filter((t) => stableAddrsLc.has(lc(t.address)));
+      const others = tokenList.filter((t) => !stableAddrsLc.has(lc(t.address)));
+      const combined = [...stables, ...others];
+
+      const v2Filtered = allowed
+        ? v2dexes.filter((d) => allowed.has(lc(d.key)))
+        : v2dexes;
+
+      const pairs = await discoverV2Pairs(combined, v2Filtered);
+      const infos = await readV2PairsInfo(pairs);
+
+      for (const info of infos.values()) {
+        const aLc = lc(info.token0);
+        const bLc = lc(info.token1);
+        const aStable = stableAddrsLc.has(aLc);
+        const bStable = stableAddrsLc.has(bLc);
+        if (aStable && !bStable) push(bLc, info.reserve0);
+        else if (bStable && !aStable) push(aLc, info.reserve1);
+      }
+      return scores;
+    },
+  };
+}
+
+// ---------- Optional V3 quoting ----------
+async function quoteV3(
+  dex: V3Dex,
+  tokenIn: Address,
+  tokenOut: Address,
+  amountIn: bigint,
+  fee: number
+): Promise<bigint> {
+  try {
+    const out = (await client.readContract({
+      address: dex.quoter,
+      abi: UNI_V3_QUOTER_ABI,
+      functionName: "quoteExactInputSingle",
+      args: [
+        {
+          tokenIn,
+          tokenOut,
+          fee,
+          amountIn,
+          sqrtPriceLimitX96: 0n,
+        } as any,
+      ],
+    })) as bigint;
+    return out ?? 0n;
+  } catch {
+    return 0n;
+  }
+}
+
+// ---------- Golden section over BigInt (discrete ternary search) ----------
+type EvalFn = (x: bigint) => Promise<bigint> | bigint;
+
+async function maximizeOverSize(
+  f: EvalFn,
+  lo: bigint,
+  hi: bigint,
+  iters: number
+): Promise<{ size: bigint; value: bigint }> {
+  if (hi <= lo) {
+    const v = await f(lo);
+    return { size: lo, value: v };
+  }
+  let bestSize = lo;
+  let bestVal = await f(lo);
+  let L = lo,
+    R = hi;
+
+  for (let i = 0; i < iters; i++) {
+    const mid1 = L + (R - L) / 3n;
+    const mid2 = R - (R - L) / 3n;
+    const [v1, v2] = await Promise.all([f(mid1), f(mid2)]);
+    const betterMid = v2 > v1 ? mid2 : mid1;
+    const betterVal = v2 > v1 ? v2 : v1;
+    if (betterVal > bestVal) {
+      bestVal = betterVal;
+      bestSize = betterMid;
+    }
+    if (v1 < v2) L = mid1 + 1n;
+    else R = mid2 - 1n;
+    if (R <= L) break;
+  }
+  return { size: bestSize, value: bestVal };
+}
+
+// ---------- Edge builder from V2 reserves and optional V3 ----------
+function buildEdgesFromData(opts: {
+  tokens: Token[];
+  v2pairsInfo: Map<Address, PairInfo>;
+  useV3?: boolean;
+  v3dexes?: V3Dex[];
+}): Edge[] {
+  const { tokens, v2pairsInfo, useV3, v3dexes } = opts;
+
+  type ABKey = `${string}-${string}`;
+  const byTokens: Map<
+    ABKey,
+    { pairs: { pair: Address; t0: Address; t1: Address; r0: bigint; r1: bigint }[] }
+  > = new Map();
+
+  for (const info of v2pairsInfo.values()) {
+    const a = lc(info.token0),
+      b = lc(info.token1);
+    const keyAB: ABKey = `${a}-${b}`;
+    const keyBA: ABKey = `${b}-${a}`;
+    if (!byTokens.has(keyAB)) byTokens.set(keyAB, { pairs: [] });
+    if (!byTokens.has(keyBA)) byTokens.set(keyBA, { pairs: [] });
+    const item = { pair: info.pair, t0: info.token0, t1: info.token1, r0: info.reserve0, r1: info.reserve1 };
+    byTokens.get(keyAB)!.pairs.push(item);
+    byTokens.get(keyBA)!.pairs.push(item);
+  }
+
+  function bestV2Quote(tokenIn: Address, tokenOut: Address, amountIn: bigint): bigint {
+    const list = byTokens.get(`${lc(tokenIn)}-${lc(tokenOut)}`);
+    if (!list || !list.pairs.length) return 0n;
+
+    let best = 0n;
+    const feeBps = 30; // approx per V2 fork
+    for (const p of list.pairs) {
+      if (lc(p.t0) === lc(tokenIn) && lc(p.t1) === lc(tokenOut)) {
+        const out = getAmountOutV2(amountIn, p.r0, p.r1, feeBps);
+        if (out > best) best = out;
+      } else if (lc(p.t1) === lc(tokenIn) && lc(p.t0) === lc(tokenOut)) {
+        const out = getAmountOutV2(amountIn, p.r1, p.r0, feeBps);
+        if (out > best) best = out;
+      }
+    }
+    return best;
+  }
 
   const edges: Edge[] = [];
-  for (const A of universe) for (const B of universe) if (lc(A.address)!==lc(B.address)) {
-    for (const f of uniV3.feeTiers) {
-      edges.push({ from:A.address, to:B.address, dexKey:`uniV3-${f}`, quote:(amt)=>quoteV3Single(client, uniV3, A.address, B.address, f, amt) });
-    }
-    if (QS_V3_POLYGON.quoterV2) {
-      edges.push({ from:A.address, to:B.address, dexKey:`qsV3`, quote:(amt)=>quoteAlgebraSingle(client, QS_V3_POLYGON.quoterV2!, A.address, B.address, amt) });
+
+  for (let i = 0; i < tokens.length; i++) {
+    for (let j = 0; j < tokens.length; j++) {
+      if (i === j) continue;
+      const A = tokens[i].address as Address;
+      const B = tokens[j].address as Address;
+
+      // V2 best-of edge
+      edges.push({
+        from: A,
+        to: B,
+        dexKey: "v2-best",
+        quote: (amt: bigint) => bestV2Quote(A, B, amt),
+      });
+
+      // Optional V3 best-of edge
+      if (useV3 && v3dexes && v3dexes.length) {
+        edges.push({
+          from: A,
+          to: B,
+          dexKey: "v3-best",
+          quote: async (amt: bigint) => {
+            let best = 0n;
+            for (const dex of v3dexes) {
+              for (const fee of dex.feeTiers) {
+                const out = await quoteV3(dex, A, B, amt, fee);
+                if (out > best) best = out;
+              }
+            }
+            return best;
+          },
+        });
+      }
     }
   }
-  for (const [key] of Object.entries(v2Pools)) {
-    const [t0,t1] = key.split('-') as Address[];
-    edges.push({ from:t0, to:t1, dexKey:'v2*', quote:(amt)=>bestV2Out(t0,t1,amt) });
-    edges.push({ from:t1, to:t0, dexKey:'v2*', quote:(amt)=>bestV2Out(t1,t0,amt) });
+
+  return edges;
+}
+
+// ---------- New helpers to expose chosen DEX per hop ----------
+type BestQuote = { out: bigint; dexKey: string };
+
+async function bestQuoteWithDex(
+  edges: Edge[],
+  A: Address,
+  B: Address,
+  amt: bigint
+): Promise<BestQuote> {
+  let best: BestQuote = { out: 0n, dexKey: "" };
+  const pending: Promise<void>[] = [];
+  for (const e of edges) {
+    if (lc(e.from) === lc(A) && lc(e.to) === lc(B)) {
+      const q = e.quote(amt);
+      if (q instanceof Promise) {
+        pending.push(
+          q.then((v) => {
+            if (v > best.out) best = { out: v, dexKey: e.dexKey };
+          })
+        );
+      } else {
+        if (q > best.out) best = { out: q, dexKey: e.dexKey };
+      }
+    }
+  }
+  if (pending.length) await Promise.all(pending);
+  return best;
+}
+
+async function simulatePathDetails(
+  allEdges: Edge[],
+  path: { edges: Edge[] },
+  amountIn: bigint,
+  slippageBps: number
+): Promise<{ amountOut: bigint; dexes: string[] }> {
+  let amt = amountIn;
+  const dexes: string[] = [];
+  for (const e of path.edges) {
+    const { out, dexKey } = await bestQuoteWithDex(allEdges, e.from as Address, e.to as Address, amt);
+    if (out <= 0n) return { amountOut: 0n, dexes: [] };
+    // per-hop haircut (same slippage model you use elsewhere)
+    amt = (out * BigInt(10_000 - slippageBps)) / 10_000n;
+    dexes.push(dexKey || "best-of");
+  }
+  return { amountOut: amt, dexes };
+}
+
+// ---------- Main entry ----------
+export async function scanAdvancedSingleAndMulti(cfg: AdvancedScanCfg): Promise<{
+  single: Array<{
+    pair: string;
+    pathTokens: `0x${string}`[];  // [base, mid, base]
+    dexes: string[];              // [leg1, leg2]
+    size: string;
+    net: string;
+    netBps: number;
+    pnlPerGas?: number;
+  }>;
+  multi: Array<{
+    path: string;                 // human label of DEXes
+    pathTokens: `0x${string}`[];  // full token path base -> ... -> base
+    dexes: string[];              // per-leg DEX choices
+    bestSize: string;
+    net: string;
+    netBps: number;
+    pnlPerGas?: number;
+  }>;
+}> {
+  const slippageBps = cfg.slippageBps ?? 30;
+  const flashFeeBps = cfg.flashFeeBps ?? 9;
+  const minNetBps = cfg.minNetBps ?? 150;
+  const onlyProfitable = cfg.onlyProfitable !== false;
+  const maxHops = (cfg.maxHops ?? 3) as 2 | 3 | 4;
+
+  // Gas price
+  const baseFee =
+    cfg.gasGwei != null
+      ? BigInt(Math.floor(cfg.gasGwei * 1e9))
+      : await client.getGasPrice();
+  const priority = cfg.priorityGwei != null ? BigInt(Math.floor(cfg.priorityGwei * 1e9)) : 0n;
+  const gasPriceWei = baseFee + priority;
+
+  // Approx gas units
+  const GAS_UNITS_SINGLE = 120_000n;
+  const GAS_UNITS_MULTI = 260_000n;
+
+  // 1) Liquidity-aware mids
+  const stableSyms = new Set(["USDC", "USDT", "DAI"]);
+  const stableAddrsLc = new Set(
+    cfg.universe.filter((t) => stableSyms.has(t.symbol)).map((t) => lc(t.address))
+  );
+  const universe = cfg.universe.slice(0, 160);
+
+  const scorer = buildLiquidityScoresFromStableSides(
+    universe,
+    stableAddrsLc,
+    cfg.v2Dexes,
+    cfg.dexAllow
+  );
+  const scores = await scorer.compute();
+
+  const bridgeAddrs = (cfg.bridgeSymbols ?? ["USDC", "USDT", "DAI", "WETH", "WMATIC"])
+    .map((sym) => universe.find((t) => t.symbol === sym)?.address)
+    .filter(Boolean) as Address[];
+
+  const TOP_MIDS = Math.max(25, Math.min(60, universe.length));
+  const topByLiq = [...scores.entries()]
+    .sort((a, b) => (b[1] > a[1] ? 1 : -1))
+    .slice(0, TOP_MIDS);
+
+  const allowedMidLc = new Set<string>([
+    ...bridgeAddrs.map((a) => lc(a)),
+    ...topByLiq.map(([addrLc]) => addrLc),
+  ]);
+
+  const tokenSet: Token[] = [];
+  const seen = new Set<string>();
+  const addToken = (t?: Token) => {
+    if (!t) return;
+    const k = lc(t.address);
+    if (seen.has(k)) return;
+    seen.add(k);
+    tokenSet.push(t);
+  };
+  addToken(cfg.base);
+  for (const t of universe) {
+    if (lc(t.address) === lc(cfg.base.address)) continue;
+    if (allowedMidLc.has(lc(t.address))) addToken(t);
   }
 
-  const paths = buildKHopPaths(edges, cfg.base.address, cfg.base.address, cfg.maxHops ?? 3, bridgeAddrs.size ? bridgeAddrs : undefined);
-  const multi: any[] = [];
-  const gasUnitsMulti = (cfg.maxHops ?? 3) === 2 ? 450_000n : 650_000n;
+  // 2) Discover V2 pairs + read reserves
+  const v2Pairs = await discoverV2Pairs(tokenSet, cfg.v2Dexes, cfg.dexAllow);
+  const v2pairsInfo = await readV2PairsInfo(v2Pairs);
 
-  const tests = [1n, 2n, 5n, 10n].map(v => v * 10n**BigInt(cfg.base.decimals)).filter(v => v <= cfg.amountInBaseMax);
+  // 3) Build edges (V2 best-of, optional V3 best-of)
+  const edges = buildEdgesFromData({
+    tokens: tokenSet,
+    v2pairsInfo,
+    useV3: !!(cfg.v3Dexes && cfg.v3Dexes.length),
+    v3dexes: cfg.v3Dexes,
+  });
 
-  for (const p of paths) for (const s of tests) {
-    const back = await simulatePathWithSlippage(p, s, slippageBps);
-    const flash = (s * flashFeeBps) / DEN;
-    const gasCost = gasPriceWei! * gasUnitsMulti;
-    const net = back - s - flash - gasCost;
+  // 4) SINGLE-HOP round-trips (base -> mid -> base)
+  const single: Array<{
+    pair: string;
+    pathTokens: `0x${string}`[];
+    dexes: string[];
+    size: string;
+    net: string;
+    netBps: number;
+    pnlPerGas?: number;
+  }> = [];
 
-    const passProf = (cfg.onlyProfitable !== false) ? (net > 0n) : true;
-    const passNet  = cfg.minNetBase ? net >= cfg.minNetBase : true;
-    const nbps     = toBps(net, s);
-    const passBps  = cfg.minNetBps ? nbps >= cfg.minNetBps : true;
+  const base = cfg.base;
+  const sampleSizes: bigint[] = [
+    cfg.amountInBaseMax / 10n,
+    cfg.amountInBaseMax / 4n,
+    cfg.amountInBaseMax / 2n,
+    cfg.amountInBaseMax,
+  ].filter((x) => x > 0n);
 
-    if (passProf && passNet && passBps) {
-      const pnlPerGas = Number(net) / Number(gasCost || 1n);
-      multi.push({
-        path: p.edges.map(e=>e.dexKey).join(' -> '),
-        bestSize: s.toString(),
-        net: net.toString(),
-        netBps: nbps,
-        pnlPerGas
+  const bestQuoteRaw = async (A: Address, B: Address, amt: bigint) =>
+    bestQuoteWithDex(edges, A, B, amt);
+
+  for (const mid of tokenSet) {
+    if (lc(mid.address) === lc(base.address)) continue;
+
+    for (const sz of sampleSizes) {
+      const leg1 = await bestQuoteRaw(base.address, mid.address, sz);
+      if (leg1.out <= 0n) continue;
+      const leg2 = await bestQuoteRaw(mid.address, base.address, leg1.out);
+      if (leg2.out <= 0n) continue;
+
+      const out2 = leg2.out;
+      const flashCost = (sz * BigInt(flashFeeBps)) / 10_000n;
+      const net = out2 - sz - flashCost;
+      const nbps = Number((net * 10_000n) / (sz || 1n));
+
+      const gasCostBaseWei = gasPriceWei * GAS_UNITS_SINGLE;
+      const pnlPerGas = Number(net) / Number(gasCostBaseWei || 1n);
+
+      const passProf = onlyProfitable ? net > 0n : true;
+      const passNet = cfg.minNetBase ? net >= cfg.minNetBase : true;
+      const passBps = nbps >= (cfg.minNetBps ?? minNetBps);
+      if (!(passProf && passNet && passBps)) continue;
+
+      const lo = sz / 5n > 0n ? sz / 5n : 1n;
+      const hi = cfg.amountInBaseMax;
+
+      const objective: EvalFn = async (x) => {
+        const l1 = await bestQuoteRaw(base.address, mid.address, x);
+        if (l1.out <= 0n) return -1n;
+        const l2 = await bestQuoteRaw(mid.address, base.address, l1.out);
+        if (l2.out <= 0n) return -1n;
+        const flash = (x * BigInt(flashFeeBps)) / 10_000n;
+        return l2.out - x - flash;
+      };
+
+      const opt = await maximizeOverSize(objective, lo, hi, 10);
+      const optBps = Number((opt.value * 10_000n) / (opt.size || 1n));
+      const pnlGas = Number(opt.value) / Number(gasPriceWei * GAS_UNITS_SINGLE || 1n);
+
+      // re-evaluate winning leg dexes at optimal size for display
+      const l1opt = await bestQuoteRaw(base.address, mid.address, opt.size);
+      const l2opt = await bestQuoteRaw(mid.address, base.address, l1opt.out);
+
+      single.push({
+        pair: `${base.symbol}/${mid.symbol}/${base.symbol}`,
+        pathTokens: [base.address, mid.address, base.address],
+        dexes: [l1opt.dexKey || "best-of", l2opt.dexKey || "best-of"],
+        size: opt.size.toString(),
+        net: opt.value.toString(),
+        netBps: optBps,
+        pnlPerGas: pnlGas,
       });
     }
   }
 
-  // sort
-  single.sort((a,b) => {
-    const an = BigInt(a.net), bn = BigInt(b.net);
-    if (bn === an) return (b.pnlPerGas ?? 0) - (a.pnlPerGas ?? 0);
-    return bn > an ? 1 : -1;
-  });
-  multi.sort((a,b) => {
-    const an = BigInt(a.net), bn = BigInt(b.net);
-    if (bn === an) return (b.pnlPerGas ?? 0) - (a.pnlPerGas ?? 0);
-    return bn > an ? 1 : -1;
-  });
+  single.sort((a, b) => b.netBps - a.netBps);
+  if (single.length > 30) single.length = 30;
+
+  // 5) MULTI-HOP cycles base -> ... -> base (≤ maxHops)
+  const allowedMidSet = new Set<string>(tokenSet.map((t) => lc(t.address)));
+  const paths = buildKHopPaths(edges, base.address, base.address, maxHops, allowedMidSet);
+
+  const multi: Array<{
+    path: string;
+    pathTokens: `0x${string}`[];
+    dexes: string[];
+    bestSize: string;
+    net: string;
+    netBps: number;
+    pnlPerGas?: number;
+  }> = [];
+
+  for (const p of paths) {
+    if (p.edges.length < 2) continue;
+
+    const tokenPath: `0x${string}`[] = [
+      p.edges[0].from as Address,
+      ...p.edges.map((e) => e.to as Address),
+    ];
+
+    for (const sz of sampleSizes) {
+      const out = await simulatePathWithSlippage(p, sz, slippageBps);
+      if (out <= 0n) continue;
+
+      const flashCost = (sz * BigInt(flashFeeBps)) / 10_000n;
+      const net = out - sz - flashCost;
+      const nbps = Number((net * 10_000n) / (sz || 1n));
+
+      const passProf = onlyProfitable ? net > 0n : true;
+      const passNet = cfg.minNetBase ? net >= cfg.minNetBase : true;
+      const passBps = nbps >= (cfg.minNetBps ?? minNetBps);
+      if (!(passProf && passNet && passBps)) continue;
+
+      const lo = sz / 5n > 0n ? sz / 5n : 1n;
+      const hi = cfg.amountInBaseMax;
+
+      const objective: EvalFn = async (x) => {
+        const y = await simulatePathWithSlippage(p, x, slippageBps);
+        const flash = (x * BigInt(flashFeeBps)) / 10_000n;
+        return y - x - flash;
+      };
+
+      const opt = await maximizeOverSize(objective, lo, hi, 10);
+      const optBps = Number((opt.value * 10_000n) / (opt.size || 1n));
+      const pnlGas = Number(opt.value) / Number(gasPriceWei * GAS_UNITS_MULTI || 1n);
+
+      // choose per-leg DEXes for display at optimal size
+      const det = await simulatePathDetails(edges, p, opt.size, slippageBps);
+      const label = det.dexes.join(" -> ");
+
+      multi.push({
+        path: label,
+        pathTokens: tokenPath,
+        dexes: det.dexes,
+        bestSize: opt.size.toString(),
+        net: opt.value.toString(),
+        netBps: optBps,
+        pnlPerGas: pnlGas,
+      });
+    }
+  }
+
+  multi.sort((a, b) => b.netBps - a.netBps);
+  if (multi.length > 50) multi.length = 50;
 
   return { single, multi };
-}
-
-// ---------------- Multi-base & concurrency wrapper ----------------
-export type AdvancedMultiBaseCfg =
-  Omit<AdvancedScanCfg, 'base'> & { bases: Token[]; topPerBase?: number };
-
-type WithBaseTag<T> = T & { baseSymbol: string; baseAddress: Address };
-
-async function mapWithConcurrency<T, R>(
-  items: T[], concurrency: number, mapper: (item: T, index: number) => Promise<R>
-): Promise<R[]> {
-  const results = new Array<R>(items.length);
-  let idx = 0;
-  const worker = async () => {
-    while (true) {
-      const i = idx++;
-      if (i >= items.length) break;
-      results[i] = await mapper(items[i], i);
-    }
-  };
-  const n = Math.max(1, Math.min(concurrency || 1, items.length));
-  await Promise.all(Array.from({ length: n }, worker));
-  return results;
-}
-
-export async function scanAdvancedManyBasesConcurrent(
-  cfg: AdvancedMultiBaseCfg,
-  opts?: { concurrency?: number }
-): Promise<{
-  single: WithBaseTag<{ route: string; pair: string; bestSize: string; net: string; netBps: number; pnlPerGas?: number; }>[]; 
-  multi:  WithBaseTag<{ path: string; bestSize: string; net: string; netBps: number; pnlPerGas?: number; }>[]; 
-}> {
-  const topN = cfg.topPerBase ?? 50;
-  const conc = Math.max(1, opts?.concurrency ?? 3);
-
-  const perBase = await mapWithConcurrency(cfg.bases, conc, async (base) => {
-    const res = await scanAdvancedSingleAndMulti({ ...cfg, base, maxHops: cfg.maxHops ?? 3 });
-    const tagSingle = res.single.map((r) => ({ ...r, baseSymbol: base.symbol, baseAddress: base.address })).slice(0, topN);
-    const tagMulti  = res.multi .map((r) => ({ ...r, baseSymbol: base.symbol, baseAddress: base.address })).slice(0, topN);
-    return { tagSingle, tagMulti };
-  });
-
-  const allSingle = perBase.flatMap(x => x.tagSingle);
-  const allMulti  = perBase.flatMap(x => x.tagMulti);
-
-  allSingle.sort((a: any, b: any) => {
-    const an = BigInt(a.net), bn = BigInt(b.net);
-    if (bn === an) return (b.pnlPerGas ?? 0) - (a.pnlPerGas ?? 0);
-    return bn > an ? 1 : -1;
-  });
-  allMulti.sort((a: any, b: any) => {
-    const an = BigInt(a.net), bn = BigInt(b.net);
-    if (bn === an) return (b.pnlPerGas ?? 0) - (a.pnlPerGas ?? 0);
-    return bn > an ? 1 : -1;
-  });
-
-  return { single: allSingle as any, multi: allMulti as any };
 }

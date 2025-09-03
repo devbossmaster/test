@@ -9,9 +9,20 @@ export const PINNED: Token[] = [
   { symbol:'USDT',   address:'0xc2132D05D31c914a87C6611C10748AaCbA11cA93', decimals:6  },
 ];
 
+/** Accepts either a full URL or a bare key and returns a valid Polygon Alchemy URL. */
+function normalizeAlchemyUrl(raw?: string | null): string | undefined {
+  if (!raw) return undefined;
+  const v = raw.trim();
+  if (!v) return undefined;
+  if (v.startsWith('http://') || v.startsWith('https://')) return v;
+  // assume it's a key
+  return `https://polygon-mainnet.g.alchemy.com/v2/${v}`;
+}
+
 const ALCHEMY_URL =
-  process.env.ALCHEMY_POLYGON_URL ||
-  process.env.NEXT_PUBLIC_ALCHEMY_POLYGON_URL ||
+  normalizeAlchemyUrl(process.env.ALCHEMY_POLYGON_URL) ||
+  normalizeAlchemyUrl(process.env.NEXT_PUBLIC_ALCHEMY_POLYGON_URL) ||
+  normalizeAlchemyUrl(process.env.ALCHEMY_KEY as any) || // optional generic key env
   '';
 
 type AssetTransfer = {
@@ -20,14 +31,18 @@ type AssetTransfer = {
 };
 
 async function rpc<T = any>(method: string, params: any[]): Promise<T> {
-  if (!ALCHEMY_URL) throw new Error('Missing ALCHEMY_POLYGON_URL');
+  if (!ALCHEMY_URL) throw new Error('Missing ALCHEMY_POLYGON_URL / NEXT_PUBLIC_ALCHEMY_POLYGON_URL / ALCHEMY_KEY');
   const r = await fetch(ALCHEMY_URL, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ id: 1, jsonrpc: '2.0', method, params }),
   });
+  if (!r.ok) {
+    const txt = await r.text().catch(() => '');
+    throw new Error(`Alchemy RPC error ${r.status}: ${txt}`);
+  }
   const j = await r.json();
-  if (j.error) throw new Error(j.error.message || 'alchemy rpc error');
+  if (j?.error) throw new Error(j.error.message || 'alchemy rpc error');
   return j.result as T;
 }
 

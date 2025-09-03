@@ -1,11 +1,13 @@
-// Path-finding utilities (≤3 hops) + slippage-aware simulation.
+// lib/graph.ts
+// Multi-hop path utilities (supports up to 4 hops) + slippage-aware simulation.
 
-import type { Address } from 'viem';
+import type { Address } from "viem";
 
 export type Edge = {
   from: Address;
   to: Address;
-  // quote(amountIn) -> amountOut
+  // Deterministic quote for a given input (must include pool math/fees internally).
+  // Can be sync or async. Return 0n when not routable.
   quote: (amountIn: bigint) => Promise<bigint> | bigint;
   dexKey: string;
   cap?: bigint; // optional capacity hint
@@ -14,82 +16,129 @@ export type Edge = {
 
 export type Path = {
   nodes: Address[]; // includes start & end
-  edges: Edge[];
+  edges: Edge[];    // edges.length === nodes.length - 1
 };
 
-export async function simulatePath(path: Path, amountIn: bigint): Promise<bigint> {
-  let amt = amountIn;
-  for (const e of path.edges) {
-    const out = await e.quote(amt);
-    amt = typeof out === 'bigint' ? out : BigInt(out as any);
-    if (amt === 0n) break;
+const lc = (a: Address) => a.toLowerCase();
+
+export async function simulatePath(
+  p: Path,
+  amountIn: bigint
+): Promise<bigint> {
+  let x = amountIn;
+  for (const e of p.edges) {
+    if (x <= 0n) return 0n;
+    const out = await e.quote(x);
+    if (!out || out <= 0n) return 0n;
+    x = out;
   }
-  return amt;
+  return x;
 }
 
-export async function simulatePathWithSlippage(path: Path, amountIn: bigint, slippageBps: number): Promise<bigint> {
-  let amt = amountIn;
+/**
+ * Conservative haircut per hop via slippageBps (e.g. 30 = 0.30%).
+ * If your quote() already fully models slippage for the chosen size,
+ * you can pass slippageBps=0 to skip the haircut.
+ */
+export async function simulatePathWithSlippage(
+  p: Path,
+  amountIn: bigint,
+  slippageBps: number
+): Promise<bigint> {
   const den = 10_000n;
-  const slip = BigInt(slippageBps);
-  for (const e of path.edges) {
-    const out = await e.quote(amt);
-    let next = typeof out === 'bigint' ? out : BigInt(out as any);
-    // Apply conservative per-leg minOut
-    next = next - (next * slip / den);
-    if (next <= 0n) return 0n;
-    amt = next;
+  const slip = BigInt(Math.max(0, slippageBps));
+  let x = amountIn;
+  for (const e of p.edges) {
+    if (x <= 0n) return 0n;
+    const out = await e.quote(x);
+    if (!out || out <= 0n) return 0n;
+    const hair = (out * slip) / den;
+    x = out - hair;
   }
-  return amt;
+  return x;
 }
 
-// Build ≤3-hop roundtrip paths start -> ... -> end using a small bridge whitelist.
-// We avoid cycles and keep unique nodes.
+/**
+ * Enumerate simple paths start -> ... -> end with hop counts in {2,3,4}.
+ * - No repeated intermediate nodes.
+ * - Optional allowedMid filter (lowercased addresses) to constrain search space.
+ */
 export function buildKHopPaths(
   edges: Edge[],
   start: Address,
   end: Address,
-  maxHops: 2 | 3,
-  allowedMid?: Set<string>, // lowercase address strings; if omitted, allow all
+  maxHops: 2 | 3 | 4,
+  allowedMid?: Set<string>,
 ): Path[] {
-  const lc = (a: Address) => a.toLowerCase();
   const E = edges;
+  const allow = (a: Address) => !allowedMid || allowedMid.has(lc(a));
 
-  function* nextEdges(from: Address) {
+  function* next(from: Address) {
     for (const e of E) if (lc(e.from) === lc(from)) yield e;
   }
 
-  const paths: Path[] = [];
+  const out: Path[] = [];
 
-  // 1-hop
-  for (const e1 of nextEdges(start)) {
-    if (lc(e1.to) === lc(end)) paths.push({ nodes: [start, end], edges: [e1] });
-  }
-  // 2-hop
-  for (const e1 of nextEdges(start)) {
-    if (allowedMid && !allowedMid.has(lc(e1.to))) continue;
-    for (const e2 of nextEdges(e1.to)) {
-      if (lc(e2.to) !== lc(end)) continue;
-      // no cycle (start != mid)
+  // 2 hops: s -> A -> e
+  if (maxHops >= 2) {
+    for (const e1 of next(start)) {
       if (lc(e1.to) === lc(start)) continue;
-      paths.push({ nodes: [start, e1.to, end], edges: [e1, e2] });
+      if (!allow(e1.to)) continue;
+      for (const e2 of next(e1.to)) {
+        if (lc(e2.to) !== lc(end)) continue;
+        out.push({ nodes: [start, e1.to, end], edges: [e1, e2] });
+      }
     }
   }
-  if (maxHops === 3) {
-    // 3-hop
-    for (const e1 of nextEdges(start)) {
-      if (allowedMid && !allowedMid.has(lc(e1.to))) continue;
-      for (const e2 of nextEdges(e1.to)) {
-        if (allowedMid && !allowedMid.has(lc(e2.to))) continue;
-        if (lc(e2.to) === lc(start)) continue;
-        for (const e3 of nextEdges(e2.to)) {
+
+  // 3 hops: s -> A -> B -> e
+  if (maxHops >= 3) {
+    for (const e1 of next(start)) {
+      const A = e1.to;
+      if (lc(A) === lc(start)) continue;
+      if (!allow(A)) continue;
+
+      for (const e2 of next(A)) {
+        const B = e2.to;
+        if (lc(B) === lc(start) || lc(B) === lc(A)) continue;
+        if (!allow(B)) continue;
+
+        for (const e3 of next(B)) {
           if (lc(e3.to) !== lc(end)) continue;
-          // avoid repeats
-          const mids = [lc(e1.to), lc(e2.to)];
-          if (new Set(mids).size !== mids.length) continue;
-          paths.push({ nodes: [start, e1.to, e2.to, end], edges: [e1, e2, e3] });
+          out.push({ nodes: [start, A, B, end], edges: [e1, e2, e3] });
         }
       }
     }
   }
-  return paths;
+
+  // 4 hops: s -> A -> B -> C -> e
+  if (maxHops >= 4) {
+    for (const e1 of next(start)) {
+      const A = e1.to;
+      if (lc(A) === lc(start)) continue;
+      if (!allow(A)) continue;
+
+      for (const e2 of next(A)) {
+        const B = e2.to;
+        if (lc(B) === lc(start) || lc(B) === lc(A)) continue;
+        if (!allow(B)) continue;
+
+        for (const e3 of next(B)) {
+          const C = e3.to;
+          if (lc(C) === lc(start) || lc(C) === lc(A) || lc(C) === lc(B)) continue;
+          if (!allow(C)) continue;
+
+          for (const e4 of next(C)) {
+            if (lc(e4.to) !== lc(end)) continue;
+            out.push({
+              nodes: [start, A, B, C, end],
+              edges: [e1, e2, e3, e4],
+            });
+          }
+        }
+      }
+    }
+  }
+
+  return out;
 }
